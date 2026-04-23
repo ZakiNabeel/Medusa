@@ -276,6 +276,11 @@ def main():
     logits_np = RNG.standard_normal((NUM_NODES, VOCAB_SIZE)).astype(np.float32)
     drafts_np = RNG.integers(0, VOCAB_SIZE, size=NUM_NODES, dtype=np.int32)
 
+    # MOCK TREE TOPOLOGY GOES HERE
+    # For a binary-like tree, node i's parent is roughly (i-1)//2. 
+    # We set node 0's parent to -1 (the root).
+    parent_indices = np.array([(i - 1) // 2 if i > 0 else -1 for i in range(NUM_NODES)], dtype=np.int32)
+
     sep = "=" * 64
     print(sep)
     print(f"  num_nodes  = {NUM_NODES}")
@@ -332,11 +337,54 @@ def main():
         print(f"\n  Speedup vs NumPy (median kernel time only) : {speedup:.2f}×")
         print(sep)
 
+        #PATH TRACING EXECUTION GOES HERE
+        # ── Tree Path Tracing ─────────────────────────────────────────────────
+        print("\n[Medusa Logic] Tracing longest valid tree path...")
+        best_node, path_length = trace_longest_path(cl_result, parent_indices)
+        
+        if path_length > 0:
+            print(f"  Longest valid path: {path_length} tokens (ending at node {best_node})")
+        else:
+            print("  No valid paths found in this speculative tree.")
+        print(sep)
+
     except ImportError:
         print("\n[OpenCL] pyopencl not found — install with:  pip install pyopencl")
     except Exception as exc:
         print(f"\n[OpenCL] Error during execution: {exc}")
         raise
+
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Tree Path Tracing (Medusa Logic)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def trace_longest_path(is_match: np.ndarray, parent_indices: np.ndarray):
+    """
+    Finds the longest continuous path of correct guesses in the candidate tree.
+    A node is only valid if it matches AND its parent is valid.
+    
+    parent_indices[i] = the index of node i's parent. 
+    A parent of -1 means it connects directly to the root (the original prompt).
+    """
+    valid_path_lengths = np.zeros_like(is_match)
+    
+    for i in range(len(is_match)):
+        if is_match[i] == 1:
+            parent = parent_indices[i]
+            # If it's attached to the root, it's a valid path of length 1
+            if parent == -1:
+                valid_path_lengths[i] = 1
+            # If its parent is part of a valid path, extend that path by 1
+            elif valid_path_lengths[parent] > 0:
+                valid_path_lengths[i] = valid_path_lengths[parent] + 1
+
+    # Find the node that ended the longest valid path
+    best_node = np.argmax(valid_path_lengths)
+    max_length = valid_path_lengths[best_node]
+    
+    return best_node, max_length
 
 
 if __name__ == "__main__":
