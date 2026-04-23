@@ -1,44 +1,49 @@
 """
-medusa_opencl_verify.py  –  Local-Memory Tiling + Parallel Reduction
-=====================================================================
-Optimised OpenCL implementation of the Medusa tree-verification step.
+medusa_opencl_verify.py  –  Dynamic Tree Candidate Generation + OpenCL Verification
+====================================================================================
+Extends the local-memory / parallel-reduction OpenCL kernel with a fully dynamic
+Medusa candidate-tree builder that replaces the static medusa_choices.py topology.
 
-Background
-----------
-In medusa_model.py → medusa_generate() the inner loop calls:
-    best_candidate, accept_length = evaluate_posterior(logits, candidates, ...)
+Two-stage pipeline
+------------------
+Stage 1 – Dynamic tree builder  (CPU, runs once per generation step)
+  build_dynamic_tree(medusa_head_logits, confidence_threshold=0.15)
 
-Under the greedy fast-path (temperature=0, fast=True) that reduces to:
-    is_match[i] = 1  if  argmax(logits[i]) == candidates[i]  else  0
+  Replaces the fixed vicuna_7b_stage2 / mc_sim_7b_63 choice lists.
+  Works level-by-level:
+    a. Softmax each Medusa head's logit vector  →  probability distribution.
+    b. Keep only tokens whose probability > confidence_threshold.
+    c. Expand the Cartesian product of surviving tokens across all heads,
+       tracking the parent index for each new node.
+    d. Returns two flat arrays ready for the OpenCL kernel:
+         candidates     int32 (num_nodes,)   — draft token at each node
+         parent_indices int32 (num_nodes,)   — parent node index (-1 = root)
+       plus a companion array:
+         node_logits    float32 (num_nodes, vocab_size)  — row-major logit
+                        matrix to feed straight into run_medusa_verify_opencl()
 
-Why the naive version is slow
-------------------------------
-The v1 kernel assigned ONE work-item to each row. That work-item had to
-read all 32 000 floats serially from global memory — no parallelism inside
-the row, terrible memory access latency.
+Stage 2 – OpenCL verification  (GPU, local-memory tiling + parallel reduction)
+  run_medusa_verify_opencl(candidates, node_logits, ...)
+  → is_match int32 (num_nodes,)
 
-Optimisation strategy (this file)
+Stage 3 – Path tracing  (CPU)
+  trace_longest_path(is_match, parent_indices)
+  → (best_node, accepted_length)
+
+Background on the static approach
+----------------------------------
+medusa_choices.py stores hand-tuned trees (e.g. vicuna_7b_stage2 has 63 nodes).
+They are topology-optimal for average inputs but waste capacity on low-confidence
+branches and miss high-confidence branches outside the fixed fan-out.
+The dynamic builder adapts the tree to the model's actual output distribution
+at every step, typically reducing num_nodes while maintaining or improving
+acceptance length.
+
+OpenCL kernel (unchanged from v2)
 -----------------------------------
-Assign ONE work-group of 256 work-items to each row:
-
-  Phase 1 – Chunked load + thread-local reduce (registers)
-    Work-item `lid` reads vocab columns  lid, lid+256, lid+512, …
-    Each work-item keeps a running (best_val, best_idx) in registers.
-    Strided access across 256 threads is coalesced on Intel iGPU.
-
-  Phase 2 – Parallel reduction in __local memory
-    All 256 (val, idx) pairs land in local_vals[256] / local_idxs[256].
-    A power-of-two reduction tree folds them to a single winner.
-    LDS used: 256 × (4 bytes float + 4 bytes int) = 2 048 bytes  (3.1 % of 64 KB).
-
-  Phase 3 – Verification
-    Work-item 0 compares final argmax against drafts[node] and writes 0/1.
-
-Grid mapping
--------------
-  global_size = (num_nodes * 256,)
+  global_size = (num_nodes * 256,)  — one 256-wide work-group per row
   local_size  = (256,)
-  → one work-group per row, 256 work-items per work-group.
+  LDS used    : 2 048 bytes per work-group  (3.1 % of 64 KB)
 
 Hardware target
 ---------------
@@ -49,11 +54,205 @@ Hardware target
 Usage
 -----
     pip install pyopencl
-    python medusa_opencl_verify.py        # benchmark + correctness check
+    python medusa_opencl_verify.py
 """
 
 import time
+from dataclasses import dataclass, field
+from typing import List, Optional, Tuple
 import numpy as np
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Stage 1 – Dynamic Candidate Tree Builder
+# ─────────────────────────────────────────────────────────────────────────────
+
+@dataclass
+class DynamicTreeOutput:
+    """
+    Everything produced by build_dynamic_tree() in one object.
+
+    Attributes
+    ----------
+    candidates : int32 (num_nodes,)
+        The draft token id stored at each tree node.  Node 0 is always the
+        root placeholder (token = -1, never verified); real candidates start
+        at index 1.
+
+    parent_indices : int32 (num_nodes,)
+        parent_indices[i] = index of node i's parent in the same flat array.
+        Root node has parent -1.
+
+    node_logits : float32 (num_nodes, vocab_size)
+        Row i holds the verification logits for node i — i.e. the logit
+        distribution over the full vocabulary *at the position being
+        predicted by node i*.  Row 0 (root) is all-zero padding and is
+        never read by the OpenCL kernel in practice.
+
+    num_nodes : int
+        Total nodes including the root placeholder.
+
+    num_levels : int
+        Number of Medusa heads that contributed at least one node.
+
+    pruned_branches : int
+        How many candidate tokens were discarded by the threshold.
+    """
+    candidates:      np.ndarray          # int32   (num_nodes,)
+    parent_indices:  np.ndarray          # int32   (num_nodes,)
+    node_logits:     np.ndarray          # float32 (num_nodes, vocab_size)
+    num_nodes:       int
+    num_levels:      int
+    pruned_branches: int
+
+
+def _softmax(logits: np.ndarray) -> np.ndarray:
+    """
+    Numerically stable row-wise softmax.
+    logits : float32 (..., vocab_size)
+    """
+    shifted = logits - logits.max(axis=-1, keepdims=True)   # prevent overflow
+    exp     = np.exp(shifted)
+    return exp / exp.sum(axis=-1, keepdims=True)
+
+
+def build_dynamic_tree(
+    medusa_head_logits: List[np.ndarray],
+    confidence_threshold: float = 0.15,
+    max_nodes: int = 256,
+) -> DynamicTreeOutput:
+    """
+    Build a candidate tree dynamically from Medusa-head logits.
+
+    This replaces the static vicuna_7b_stage2 / mc_sim_7b_63 choice lists
+    from medusa_choices.py.  At each generation step the tree topology is
+    derived from the model's own confidence, so only probable branches
+    are expanded and dead branches are pruned early.
+
+    Parameters
+    ----------
+    medusa_head_logits : list of float32 arrays, each shape (vocab_size,)
+        One logit vector per Medusa head, in head order (head 0 predicts
+        token t+1, head 1 predicts t+2, …).  These are the raw pre-softmax
+        outputs from model.medusa_head[i].
+
+    confidence_threshold : float, default 0.15
+        Minimum softmax probability for a token to be added as a child node.
+        Tokens below this value are pruned.  Typical useful range: 0.05–0.30.
+        A lower value grows larger trees; a higher value produces sparser,
+        more confident trees.
+
+    max_nodes : int, default 256
+        Hard ceiling on tree size.  Prevents pathological growth when many
+        tokens exceed the threshold at a low-confidence level.  Expansion
+        stops (breadth-first) once this limit is reached.
+
+    Returns
+    -------
+    DynamicTreeOutput
+        See dataclass docstring.  Pass .candidates and .node_logits directly
+        to run_medusa_verify_opencl(); pass .parent_indices to
+        trace_longest_path().
+
+    Algorithm
+    ---------
+    The tree is built level-by-level (BFS).  Each level corresponds to one
+    Medusa head:
+
+      Level 0 (root, index 0):
+        Placeholder node, token = -1, parent = -1.
+        Not submitted to the OpenCL kernel.
+
+      Level k  (head k-1, predicts position t+k):
+        For every live node at level k-1, apply softmax to head-(k-1) logits
+        and keep all tokens with probability > confidence_threshold.
+        Each surviving token becomes a new child node whose parent_index
+        points to the node that spawned it.
+
+    The resulting flat arrays are ordered BFS (level by level), so
+    parent_indices[i] < i always holds — a property trace_longest_path()
+    relies on.
+    """
+    vocab_size    = medusa_head_logits[0].shape[0]
+    num_heads     = len(medusa_head_logits)
+    pruned_total  = 0
+
+    # ── Pre-compute softmax for every head once ──────────────────────────────
+    head_probs: List[np.ndarray] = []
+    for raw_logits in medusa_head_logits:
+        head_probs.append(_softmax(raw_logits.astype(np.float32)))
+
+    # ── Flat tree storage ────────────────────────────────────────────────────
+    # Node 0 is the root placeholder; real nodes start at 1.
+    candidates_list:     List[int]        = [-1]          # token id at each node
+    parent_list:         List[int]        = [-1]          # parent node index
+    node_level:          List[int]        = [0]           # which head produced this node
+    # node_logits will be filled after we know num_nodes
+    # We collect (node_index, head_index) pairs to look up logits later.
+    node_head_idx:       List[int]        = [0]           # placeholder uses head 0
+
+    # Current frontier: list of node indices at the latest level
+    frontier: List[int] = [0]   # starts at root
+
+    num_levels_active = 0
+
+    # ── BFS expansion ────────────────────────────────────────────────────────
+    for head_idx in range(num_heads):
+        if not frontier or len(candidates_list) >= max_nodes:
+            break
+
+        probs        = head_probs[head_idx]                 # (vocab_size,)
+        # Indices of tokens that pass the threshold, sorted descending by prob
+        passing_mask = probs > confidence_threshold
+        passing_ids  = np.where(passing_mask)[0]
+        pruned_total += int((~passing_mask).sum())
+
+        if len(passing_ids) == 0:
+            # No token at this level clears the bar — entire subtree pruned
+            break
+
+        next_frontier: List[int] = []
+
+        for parent_node_idx in frontier:
+            for token_id in passing_ids:
+                new_node_idx = len(candidates_list)
+                if new_node_idx >= max_nodes:
+                    break
+                candidates_list.append(int(token_id))
+                parent_list.append(parent_node_idx)
+                node_level.append(head_idx + 1)
+                node_head_idx.append(head_idx)
+                next_frontier.append(new_node_idx)
+            if len(candidates_list) >= max_nodes:
+                break
+
+        frontier = next_frontier
+        num_levels_active += 1
+
+    # ── Assemble flat numpy arrays ────────────────────────────────────────────
+    num_nodes = len(candidates_list)
+
+    candidates     = np.array(candidates_list, dtype=np.int32)
+    parent_indices = np.array(parent_list,     dtype=np.int32)
+
+    # node_logits[i] = the verification logit row for node i.
+    # For node i produced by head h, we use head h's raw logit vector as the
+    # "what does the model think comes next at this position" signal —
+    # exactly what the OpenCL argmax-vs-draft check needs.
+    # Row 0 (root) is zero-padded and never used by the kernel.
+    node_logits = np.zeros((num_nodes, vocab_size), dtype=np.float32)
+    for i in range(1, num_nodes):
+        h = node_head_idx[i]
+        node_logits[i] = medusa_head_logits[h]
+
+    return DynamicTreeOutput(
+        candidates      = candidates,
+        parent_indices  = parent_indices,
+        node_logits     = node_logits,
+        num_nodes       = num_nodes,
+        num_levels      = num_levels_active,
+        pruned_branches = pruned_total,
+    )
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  OpenCL kernel
@@ -266,92 +465,158 @@ def run_medusa_verify_python(drafts_np: np.ndarray, logits_np: np.ndarray):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def main():
-    # vicuna_7b_stage2 tree  →  63 candidate nodes; typical LLM vocab size.
-    NUM_NODES  = 63
+    # ── Synthetic inputs that mimic one step of medusa_generate() ─────────────
+    # vicuna_7b_stage2 uses 5 Medusa heads and vocab_size = 32 000.
+    NUM_HEADS  = 5
     VOCAB_SIZE = 32_000
-    WARMUP     = 3     # discarded passes (JIT, cache warm-up)
-    REPEATS    = 20    # timed passes; we report the median
+    WARMUP     = 3
+    REPEATS    = 20
+    # confidence_threshold for the demo.
+    # Real Medusa heads produce sharply-peaked distributions (top token often
+    # >0.40).  Random normal logits over 32 000 tokens produce a much flatter
+    # softmax (~3e-5 per token), so we use a lower threshold here so the demo
+    # produces a non-trivial tree.  In production keep this at 0.05–0.20.
+    CONF_THR   = 3e-5
 
-    RNG       = np.random.default_rng(42)
-    logits_np = RNG.standard_normal((NUM_NODES, VOCAB_SIZE)).astype(np.float32)
-    drafts_np = RNG.integers(0, VOCAB_SIZE, size=NUM_NODES, dtype=np.int32)
+    RNG = np.random.default_rng(42)
 
-    # MOCK TREE TOPOLOGY GOES HERE
-    # For a binary-like tree, node i's parent is roughly (i-1)//2. 
-    # We set node 0's parent to -1 (the root).
-    parent_indices = np.array([(i - 1) // 2 if i > 0 else -1 for i in range(NUM_NODES)], dtype=np.int32)
+    # Simulate raw Medusa-head logit outputs: one (vocab_size,) vector per head.
+    # In production these come from model.medusa_head[i](hidden_states).
+    medusa_head_logits: List[np.ndarray] = [
+        RNG.standard_normal(VOCAB_SIZE).astype(np.float32)
+        for _ in range(NUM_HEADS)
+    ]
 
-    sep = "=" * 64
+    sep = "=" * 68
     print(sep)
-    print(f"  num_nodes  = {NUM_NODES}")
-    print(f"  vocab_size = {VOCAB_SIZE}")
-    print(f"  WG_SIZE    = {WG_SIZE}   (256 work-items, one WG per row)")
-    print(f"  LDS/WG     = {WG_SIZE * 8} bytes  (float[256] + int[256])")
+    print("  Stage 1 — Dynamic Candidate Tree Builder")
     print(sep)
 
-    # ── NumPy baseline ────────────────────────────────────────────────────────
+    # ── Stage 1: build dynamic tree ───────────────────────────────────────────
+    tree = build_dynamic_tree(
+        medusa_head_logits,
+        confidence_threshold = CONF_THR,
+        max_nodes            = 256,
+    )
+
+    print(f"  confidence_threshold : {CONF_THR}")
+    print(f"  num_heads            : {NUM_HEADS}")
+    print(f"  vocab_size           : {VOCAB_SIZE}")
+    print(f"  ─────────────────────────────────────────")
+    print(f"  nodes in tree        : {tree.num_nodes}  "
+          f"(incl. root placeholder)")
+    print(f"  active levels        : {tree.num_levels}  "
+          f"(of {NUM_HEADS} heads)")
+    print(f"  branches pruned      : {tree.pruned_branches}")
+    print(f"  node_logits shape    : {tree.node_logits.shape}")
+    print()
+    print("  candidates[:8]      :", tree.candidates[:8].tolist())
+    print("  parent_indices[:8]  :", tree.parent_indices[:8].tolist())
+
+    # ── Verification nodes: skip root placeholder (index 0) ──────────────────
+    # The root token=-1 is never a real draft; we verify nodes 1..num_nodes-1.
+    verify_candidates = tree.candidates[1:]       # int32  (num_nodes-1,)
+    verify_logits     = tree.node_logits[1:]      # float32 (num_nodes-1, vocab_size)
+    verify_parents    = tree.parent_indices[1:]   # for path tracing, re-index to 0-based
+    # Re-index parents so that the verified sub-array is self-consistent:
+    # original parent=0 (root) becomes -1 in the verified view.
+    verify_parents_reindexed = np.where(
+        verify_parents == 0, -1, verify_parents - 1
+    ).astype(np.int32)
+
+    num_verify = len(verify_candidates)
+
+    print()
+    print(sep)
+    print(f"  Stage 2 — OpenCL Verification  ({num_verify} nodes)")
+    print(sep)
+    print(f"  WG_SIZE  = {WG_SIZE}   (one work-group per node row)")
+    print(f"  LDS/WG   = {WG_SIZE * 8} bytes")
+
+    # ── NumPy baseline (the sequential loop being replaced) ──────────────────
     for _ in range(WARMUP):
-        run_medusa_verify_python(drafts_np, logits_np)
+        run_medusa_verify_python(verify_candidates, verify_logits)
 
-    py_times  = [run_medusa_verify_python(drafts_np, logits_np)[1] for _ in range(REPEATS)]
-    py_result = run_medusa_verify_python(drafts_np, logits_np)[0]
+    py_times  = [
+        run_medusa_verify_python(verify_candidates, verify_logits)[1]
+        for _ in range(REPEATS)
+    ]
+    py_result = run_medusa_verify_python(verify_candidates, verify_logits)[0]
     py_med    = float(np.median(py_times)) * 1e3
-
-    print(f"\n[Python/NumPy]            median = {py_med:.4f} ms"
+    print(f"\n  [Python/NumPy]           median = {py_med:.4f} ms"
           f"   matches = {py_result.sum()}")
 
-    # ── OpenCL optimised kernel ───────────────────────────────────────────────
+    # ── OpenCL kernel ─────────────────────────────────────────────────────────
     try:
-        import pyopencl as cl   # noqa: F401
+        import pyopencl as cl  # noqa: F401
 
         print()
         ctx, queue, program = build_opencl_context()
 
         for _ in range(WARMUP):
-            run_medusa_verify_opencl(drafts_np, logits_np,
+            run_medusa_verify_opencl(verify_candidates, verify_logits,
                                      ctx=ctx, queue=queue, program=program)
 
         cl_times = [
-            run_medusa_verify_opencl(drafts_np, logits_np,
+            run_medusa_verify_opencl(verify_candidates, verify_logits,
                                      ctx=ctx, queue=queue, program=program)[1]
             for _ in range(REPEATS)
         ]
         cl_result, _ = run_medusa_verify_opencl(
-            drafts_np, logits_np, ctx=ctx, queue=queue, program=program
+            verify_candidates, verify_logits,
+            ctx=ctx, queue=queue, program=program,
         )
         cl_med = float(np.median(cl_times)) * 1e3
 
-        print(f"\n[OpenCL local-reduce]     median = {cl_med:.4f} ms"
+        print(f"\n  [OpenCL local-reduce]    median = {cl_med:.4f} ms"
               f"   matches = {cl_result.sum()}")
 
-        # ── Correctness check ─────────────────────────────────────────────────
+        # Correctness
         print()
         if np.array_equal(py_result, cl_result):
-            print("✓  Results match — kernel is correct.")
+            print("  ✓  NumPy and OpenCL results match.")
         else:
             bad = np.where(py_result != cl_result)[0]
-            print(f"✗  Mismatch at {len(bad)} node(s): indices {bad}")
+            print(f"  ✗  Mismatch at {len(bad)} node(s): {bad}")
 
-        # ── Speedup ───────────────────────────────────────────────────────────
         speedup = py_med / cl_med if cl_med > 0 else float("inf")
-        print(f"\n  Speedup vs NumPy (median kernel time only) : {speedup:.2f}×")
-        print(sep)
+        print(f"\n  Speedup vs NumPy (kernel time only) : {speedup:.2f}×")
 
-        #PATH TRACING EXECUTION GOES HERE
-        # ── Tree Path Tracing ─────────────────────────────────────────────────
-        print("\n[Medusa Logic] Tracing longest valid tree path...")
-        best_node, path_length = trace_longest_path(cl_result, parent_indices)
-        
-        if path_length > 0:
-            print(f"  Longest valid path: {path_length} tokens (ending at node {best_node})")
+        # ── Stage 3: path tracing ─────────────────────────────────────────────
+        print()
+        print(sep)
+        print("  Stage 3 — Tree Path Tracing")
+        print(sep)
+        best_node, path_len = trace_longest_path(cl_result, verify_parents_reindexed)
+
+        if path_len > 0:
+            # Reconstruct the accepted token sequence for logging
+            path_tokens: List[int] = []
+            cur = best_node
+            while cur != -1:
+                path_tokens.append(int(verify_candidates[cur]))
+                parent = int(verify_parents_reindexed[cur])
+                cur = parent if parent >= 0 else -1
+            path_tokens.reverse()
+
+            print(f"  Accepted length : {path_len} token(s)")
+            print(f"  Terminal node   : {best_node}")
+            print(f"  Token sequence  : {path_tokens}")
         else:
-            print("  No valid paths found in this speculative tree.")
+            print("  No valid path found — no speculative tokens accepted.")
+
         print(sep)
 
     except ImportError:
         print("\n[OpenCL] pyopencl not found — install with:  pip install pyopencl")
+        # Still show path-tracing on the NumPy result so the demo is useful
+        if len(py_result) > 0:
+            best_node, path_len = trace_longest_path(py_result, verify_parents_reindexed)
+            print(f"\n[Path trace on NumPy result]  length={path_len}  node={best_node}")
+        else:
+            print("\n[Path trace] No nodes to trace (tree was empty).")
     except Exception as exc:
-        print(f"\n[OpenCL] Error during execution: {exc}")
+        print(f"\n[OpenCL] Error: {exc}")
         raise
 
 
