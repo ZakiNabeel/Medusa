@@ -22,7 +22,7 @@ class GPT2Medusa(nn.Module):
         super().__init__()
         self.tokenizer = AutoTokenizer.from_pretrained(base_model_name)
         self.base_model = AutoModelForCausalLM.from_pretrained(base_model_name)
-        
+
         # Move to GPU
         self.base_model = self.base_model.cuda()
 
@@ -91,7 +91,8 @@ class DynamicTreeOutput:
     pruned_branches: int
 
 
-def build_dynamic_tree(medusa_head_logits: List[np.ndarray], confidence_threshold: float = 0.15, max_nodes: int = 256) -> DynamicTreeOutput:
+#def build_dynamic_tree(medusa_head_logits: List[np.ndarray], confidence_threshold: float = 0.15, max_nodes: int = 256) -> DynamicTreeOutput:
+def build_dynamic_tree(medusa_head_logits, confidence_thresholds, max_nodes=256): #new
     vocab_size = medusa_head_logits[0].shape[0]
     num_heads = len(medusa_head_logits)
     pruned_total = 0
@@ -111,7 +112,8 @@ def build_dynamic_tree(medusa_head_logits: List[np.ndarray], confidence_threshol
             break
 
         probs = head_probs[head_idx]
-        passing_mask = probs > confidence_threshold
+        #passing_mask = probs > confidence_threshold
+        passing_mask = probs > confidence_thresholds[head_idx] #new for batching
         passing_ids = np.where(passing_mask)[0]
         pruned_total += int((~passing_mask).sum())
 
@@ -155,50 +157,54 @@ def build_dynamic_tree(medusa_head_logits: List[np.ndarray], confidence_threshol
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  STAGE 3 – Base Model Verification (BATCHED)
+#  STAGE 3 – Base Model Verification (BATCHED + (NEW) WITH PREFIX GROUPING)
 # ══════════════════════════════════════════════════════════════════════════════
 
 def get_base_model_verification_logits(model, input_ids, tree):
+    """
+    new:
+    Optimized: groups nodes by shared prefix, one forward pass per unique prefix.
+    Reduces ~255 forward passes to ~3-10 depending on tree depth.
+    """
     vocab_size = model.vocab_size
-    num_verify = tree.num_nodes - 1
-    
-    sequences = []
-    lengths = []
-    
-    for verify_idx in range(num_verify):
-        tree_node_idx = verify_idx + 1
-        
+    num_nodes = tree.num_nodes
+    candidates = tree.candidates
+    parent_indices = tree.parent_indices
+
+    # Group nodes by their path-to-parent (the prefix the base model sees)
+    prefix_map = {}
+    for node_idx in range(1, num_nodes):
         path_tokens = []
-        cur = tree_node_idx
-        while cur != 0:
-            path_tokens.append(int(tree.candidates[cur]))
-            cur = int(tree.parent_indices[cur])
+        cur = parent_indices[node_idx]
+        while cur > 0:
+            path_tokens.append(int(candidates[cur]))
+            cur = int(parent_indices[cur])
         path_tokens.reverse()
-        
-        prefix = path_tokens[:-1]
-        
-        if len(prefix) == 0:
-            seq = input_ids[0]
-        else:
-            extra = torch.tensor(prefix, dtype=torch.long).cuda()
-            seq = torch.cat([input_ids[0], extra], dim=0)
-        
-        sequences.append(seq)
-        lengths.append(seq.shape[0])
-    
-    max_len = max(lengths)
-    padded = torch.zeros(num_verify, max_len, dtype=torch.long).cuda()
-    for i, seq in enumerate(sequences):
-        padded[i, :seq.shape[0]] = seq
-    
+        prefix_key = tuple(path_tokens)
+        if prefix_key not in prefix_map:
+            prefix_map[prefix_key] = []
+        prefix_map[prefix_key].append(node_idx)
+
+    verify_logits = np.zeros((num_nodes, vocab_size), dtype=np.float32)
+
     with torch.no_grad():
-        outputs = model.base_model(padded)
-    
-    verify_logits = np.zeros((num_verify, vocab_size), dtype=np.float32)
-    for i, length in enumerate(lengths):
-        verify_logits[i] = outputs.logits[i, length - 1, :].cpu().numpy()
-    
-    return verify_logits
+        for prefix_key, node_indices in prefix_map.items():
+            if len(prefix_key) == 0:
+                seq = input_ids
+            else:
+                prefix_tensor = torch.tensor(
+                    list(prefix_key), dtype=torch.long
+                ).unsqueeze(0).cuda()
+                seq = torch.cat([input_ids, prefix_tensor], dim=-1)
+
+            outputs = model.base_model(seq)
+            base_logits_row = outputs.logits[0, -1, :].cpu().numpy()
+
+            for node_idx in node_indices:
+                verify_logits[node_idx] = base_logits_row
+
+    # Return only rows 1..num_nodes (skip root)
+    return verify_logits[1:]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -350,11 +356,18 @@ def run_pipeline(prompt: str = "The capital of France is", num_heads: int = 3, l
     print("  Loading GPT-2 + Medusa heads...")
     t_inf_start = time.perf_counter()
     model = GPT2Medusa(num_heads=num_heads)
-    
+
     # Load trained heads
-    checkpoint = torch.load('/content/drive/MyDrive/medusa_project/trained_heads.pt')
+    #checkpoint = torch.load('/content/drive/MyDrive/medusa_project/trained_heads.pt')
+    #state_dict = checkpoint['model_state_dict']
+    #new_state_dict = {key.replace('heads.', ''): value for key, value in state_dict.items()}
+    #model.medusa_heads.load_state_dict(new_state_dict)
+    checkpoint = torch.load('/content/drive/MyDrive/medusa_project/trained_heads_5000.pt') #use the newly trained heads
     state_dict = checkpoint['model_state_dict']
-    new_state_dict = {key.replace('heads.', ''): value for key, value in state_dict.items()}
+    # Checkpoint was saved from SimpleMedusaHeads (keys: heads.0.weight)
+    # GPT2Medusa.medusa_heads is a ModuleList (expects keys: 0.weight)
+    # Strip the 'heads.' prefix
+    new_state_dict = {k.replace('heads.', ''): v for k, v in state_dict.items()}
     model.medusa_heads.load_state_dict(new_state_dict)
     model.medusa_heads.cuda()
     model.medusa_heads.eval()
@@ -399,7 +412,8 @@ def run_pipeline(prompt: str = "The capital of France is", num_heads: int = 3, l
     print(f"  Mean adaptive threshold: {mean_threshold:.5f}")
 
     t_tree_start = time.perf_counter()
-    tree = build_dynamic_tree(medusa_logits, confidence_threshold=mean_threshold, max_nodes=max_nodes)
+  #  tree = build_dynamic_tree(medusa_logits, confidence_threshold=mean_threshold, max_nodes=max_nodes)
+    tree = build_dynamic_tree(medusa_logits, confidence_thresholds=thresholds, max_nodes=max_nodes) #new for batching
     t_tree = time.perf_counter() - t_tree_start
 
     print(f"  Tree build time: {t_tree * 1e3:.2f} ms")
@@ -421,7 +435,7 @@ def run_pipeline(prompt: str = "The capital of France is", num_heads: int = 3, l
     print(f"\n{sep2}")
     print(f"  STAGE 3 — Base Model Verification ({num_verify} candidate nodes)")
     print(sep2)
-    
+
     print("  Running batched base model verification (ONE forward pass)...")
     t_base_start = time.perf_counter()
     real_verify_logits = get_base_model_verification_logits(model, input_ids, tree)
@@ -471,7 +485,7 @@ def run_pipeline(prompt: str = "The capital of France is", num_heads: int = 3, l
         accepted_text = model.tokenizer.decode(path_tokens)
         print(f"  ✓ Accepted {accepted_length} speculative token(s)")
         print(f"  Decoded text: \"{accepted_text}\"")
-        
+
         # FIX 4: Correctness check against greedy baseline
         greedy_tokens = []
         check_ids = input_ids.clone()
@@ -481,7 +495,7 @@ def run_pipeline(prompt: str = "The capital of France is", num_heads: int = 3, l
                 next_tok = out.logits[0, -1, :].argmax().item()
                 greedy_tokens.append(next_tok)
                 check_ids = torch.cat([check_ids, torch.tensor([[next_tok]]).cuda()], dim=-1)
-        
+
         if path_tokens == greedy_tokens:
             print(f"  ✓ Correctness verified: accepted tokens match greedy baseline")
         else:
