@@ -56,7 +56,7 @@ results = medusa_generate_tree_attention(
     tokenizer=tokenizer,
     max_new_tokens=max_new_tokens,
     verbose=True, 
-    entropy_threshold=3.0, 
+    entropy_threshold=4.0, 
     enable_entropy_pruning=True 
 )
 
